@@ -1,0 +1,1097 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Combined CloudFormation Template for AWS DevOps Labs - Includes Multi-Stage Deployment and Automated Patching'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: 'devops-labs'
+    Description: Name prefix for resources created by this template
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instances
+
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t3.micro
+      - t3.small
+    Description: EC2 instance type for the application servers
+
+  SSHLocation:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: The IP address range that can be used to SSH to the EC2 instances
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: Must be a valid IP CIDR range of the form x.x.x.x/x
+
+  AdminEmail:
+    Type: String
+    Default: 'admin@example.com'
+    Description: Email address to receive notifications
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+
+  GitHubUsername:
+    Type: String
+    Default: 'YOUR_USERNAME'
+    Description: GitHub username for source repositories
+
+  LabToLaunch:
+    Type: String
+    Default: 'both'
+    AllowedValues:
+      - 'both'
+      - 'multi-stage-deployment'
+      - 'automated-patching'
+    Description: Which lab environment to launch
+
+Conditions:
+  LaunchMultiStageDeployment: !Or [!Equals [!Ref LabToLaunch, 'both'], !Equals [!Ref LabToLaunch, 'multi-stage-deployment']]
+  LaunchAutomatedPatching: !Or [!Equals [!Ref LabToLaunch, 'both'], !Equals [!Ref LabToLaunch, 'automated-patching']]
+
+
+Resources:
+  # -----------------------------------------------------
+  # VPC and Network Resources (shared between labs)
+  # -----------------------------------------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-VPC"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-IGW"
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-PublicSubnet1"
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-PublicSubnet2"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-PublicRouteTable"
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP and SSH
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-WebSecurityGroup"
+
+  # -----------------------------------------------------
+  # Lab 020-360: Multi-Stage Deployment Resources
+  # -----------------------------------------------------
+  
+  # S3 Bucket for Pipeline Artifacts
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Condition: LaunchMultiStageDeployment
+    Properties:
+      BucketName: !Sub "multistage-artifacts-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-ArtifactBucket"
+
+  # IAM Roles for Multi-Stage Deployment
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Condition: LaunchMultiStageDeployment
+    Properties:
+      RoleName: CodeBuildServiceRole-MultiStage
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+      Policies:
+        - PolicyName: CodeBuildServicePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource:
+                  - !If
+                    - LaunchMultiStageDeployment
+                    - !Sub arn:aws:s3:::${ArtifactBucket}/*
+                    - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-CodeBuildServiceRole"
+
+  CodeDeployServiceRole:
+    Type: AWS::IAM::Role
+    Condition: LaunchMultiStageDeployment
+    Properties:
+      RoleName: CodeDeployServiceRole-MultiStage
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-CodeDeployServiceRole"
+
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Condition: LaunchMultiStageDeployment
+    Properties:
+      RoleName: CodePipelineServiceRole-MultiStage
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelineServicePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                Resource:
+                  - !If [LaunchMultiStageDeployment, !Sub "arn:aws:s3:::${ArtifactBucket}", !Ref AWS::NoValue]
+                  - !If [LaunchMultiStageDeployment, !Sub "arn:aws:s3:::${ArtifactBucket}/*", !Ref AWS::NoValue]
+              - Effect: Allow
+                Action:
+                  - codestar-connections:UseConnection
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - codedeploy:CreateDeployment
+                  - codedeploy:GetApplicationRevision
+                  - codedeploy:GetDeployment
+                  - codedeploy:GetDeploymentConfig
+                  - codedeploy:RegisterApplicationRevision
+                  - codedeploy:GetApplication
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: '*'
+                Condition:
+                  StringEqualsIfExists:
+                    iam:PassedToService:
+                      - codedeploy.amazonaws.com
+                      - codebuild.amazonaws.com
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-CodePipelineServiceRole"
+
+  # EC2 IAM Role for instances to access DynamoDB 
+  EC2MultiStageRole:
+    Type: AWS::IAM::Role
+    Condition: LaunchMultiStageDeployment
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+      Policies:
+        - PolicyName: EC2InstancePermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeTags
+                  - ec2messages:*
+                  - ssmmessages:*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub arn:aws:s3:::aws-codedeploy-${AWS::Region}/*
+                  - !If [LaunchMultiStageDeployment, !Sub "arn:aws:s3:::${ArtifactBucket}/*", !Ref AWS::NoValue]
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-EC2MultiStageRole"
+
+  EC2MultiStageInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: LaunchMultiStageDeployment
+    Properties:
+      Roles:
+        - !Ref EC2MultiStageRole
+
+  # DynamoDB Table
+  UserDataTable:
+    Type: AWS::DynamoDB::Table
+    Condition: LaunchMultiStageDeployment
+    Properties:
+      TableName: multi-stage-app-user-data
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-UserDataTable"
+
+  # EC2 Instances for Multi-Stage Deployment
+  DevInstance:
+    Type: AWS::EC2::Instance
+    Condition: LaunchMultiStageDeployment
+    Properties:
+      InstanceType: !Ref InstanceType
+      SecurityGroupIds:
+        - !Ref WebSecurityGroup
+      KeyName: !Ref KeyPairName
+      ImageId: !Sub "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}"
+      SubnetId: !Ref PublicSubnet1
+      IamInstanceProfile: !Ref EC2MultiStageInstanceProfile
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-DevInstance"
+        - Key: Environment
+          Value: Dev
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          # Update system
+          yum update -y
+          yum install -y ruby wget python3 python3-pip git
+
+          # Install CodeDeploy agent
+          cd /home/ec2-user
+          wget https://aws-codedeploy-${AWS::Region}.s3.amazonaws.com/latest/install
+          chmod +x ./install
+          ./install auto
+          service codedeploy-agent status
+
+          # Install Flask and other dependencies
+          pip3 install Flask==2.0.1 boto3==1.18.0
+
+  TestInstance:
+    Type: AWS::EC2::Instance
+    Condition: LaunchMultiStageDeployment
+    Properties:
+      InstanceType: !Ref InstanceType
+      SecurityGroupIds:
+        - !Ref WebSecurityGroup
+      KeyName: !Ref KeyPairName
+      ImageId: !Sub "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}"
+      SubnetId: !Ref PublicSubnet1
+      IamInstanceProfile: !Ref EC2MultiStageInstanceProfile
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-TestInstance"
+        - Key: Environment
+          Value: Test
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          # Update system
+          yum update -y
+          yum install -y ruby wget python3 python3-pip git
+
+          # Install CodeDeploy agent
+          cd /home/ec2-user
+          wget https://aws-codedeploy-${AWS::Region}.s3.amazonaws.com/latest/install
+          chmod +x ./install
+          ./install auto
+          service codedeploy-agent status
+
+          # Install Flask and other dependencies
+          pip3 install Flask==2.0.1 boto3==1.18.0
+
+  ProdInstance:
+    Type: AWS::EC2::Instance
+    Condition: LaunchMultiStageDeployment
+    Properties:
+      InstanceType: !Ref InstanceType
+      SecurityGroupIds:
+        - !Ref WebSecurityGroup
+      KeyName: !Ref KeyPairName
+      ImageId: !Sub "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}"
+      SubnetId: !Ref PublicSubnet2
+      IamInstanceProfile: !Ref EC2MultiStageInstanceProfile
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-ProdInstance"
+        - Key: Environment
+          Value: Prod
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          # Update system
+          yum update -y
+          yum install -y ruby wget python3 python3-pip git
+
+          # Install CodeDeploy agent
+          cd /home/ec2-user
+          wget https://aws-codedeploy-${AWS::Region}.s3.amazonaws.com/latest/install
+          chmod +x ./install
+          ./install auto
+          service codedeploy-agent status
+
+          # Install Flask and other dependencies
+          pip3 install Flask==2.0.1 boto3==1.18.0
+
+  # CodeDeploy Application and Deployment Groups
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Condition: LaunchMultiStageDeployment
+    Properties:
+      ApplicationName: multi-stage-app
+      ComputePlatform: Server
+
+  DevDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Condition: LaunchMultiStageDeployment
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      DeploymentGroupName: dev-deployment-group
+      DeploymentConfigName: CodeDeployDefault.AllAtOnce
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+      Ec2TagFilters:
+        - Key: Environment
+          Value: Dev
+          Type: KEY_AND_VALUE
+
+  TestDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Condition: LaunchMultiStageDeployment
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      DeploymentGroupName: test-deployment-group
+      DeploymentConfigName: CodeDeployDefault.OneAtATime
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+      Ec2TagFilters:
+        - Key: Environment
+          Value: Test
+          Type: KEY_AND_VALUE
+
+  ProdDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Condition: LaunchMultiStageDeployment
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      DeploymentGroupName: prod-deployment-group
+      DeploymentConfigName: CodeDeployDefault.HalfAtATime
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+      Ec2TagFilters:
+        - Key: Environment
+          Value: Prod
+          Type: KEY_AND_VALUE
+
+  # CodeBuild Project
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Condition: LaunchMultiStageDeployment
+    Properties:
+      Name: multi-stage-app-build
+      Artifacts:
+        Type: S3
+        Location: !Ref ArtifactBucket
+        Name: multi-stage-app-build
+        Packaging: ZIP
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Source:
+        Type: GITHUB
+        Location: !Sub "https://github.com/${GitHubUsername}/multi-stage-app.git"
+        BuildSpec: buildspec.yml
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-CodeBuildProject"
+
+  # -----------------------------------------------------
+  # Lab 060-140: Automated Patching Resources
+  # -----------------------------------------------------
+  
+  # IAM Roles for Automated Patching
+  EC2PatchInstanceRole:
+    Type: AWS::IAM::Role
+    Condition: LaunchAutomatedPatching
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: EC2InstanceSSMPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                  - ec2messages:*
+                  - ssmmessages:*
+                  - ssm:DescribeInstanceInformation
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-EC2PatchInstanceRole"
+
+  EC2PatchInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: LaunchAutomatedPatching
+    Properties:
+      Roles:
+        - !Ref EC2PatchInstanceRole
+
+  ConfigRole:
+    Type: AWS::IAM::Role
+    Condition: LaunchAutomatedPatching
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWS_ConfigRole
+      Policies:
+        - PolicyName: ConfigBucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub "arn:aws:s3:::${ConfigBucket}/*"
+                Condition:
+                  StringLike:
+                    s3:x-amz-acl: bucket-owner-full-control
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-ConfigRole"
+
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Condition: LaunchAutomatedPatching
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EventBridgeSSMPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: '*'
+              - Effect: Allow
+                Action: ssm:StartAutomationExecution
+                Resource: '*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !If [LaunchAutomatedPatching, !GetAtt SSMAutomationRole.Arn, !Ref AWS::NoValue]
+        - PolicyName: EventBridgeSNSPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !If [LaunchAutomatedPatching, !Ref PatchNotificationTopic, !Ref AWS::NoValue]
+        - PolicyName: EventBridgeLambdaPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !If [LaunchAutomatedPatching, !GetAtt PatchLoggerFunction.Arn, !Ref AWS::NoValue]
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-EventBridgeRole"
+
+  SSMAutomationRole:
+    Type: AWS::IAM::Role
+    Condition: LaunchAutomatedPatching
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonSSMAutomationRole
+      Policies:
+        - PolicyName: SSMAutomationPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:StartAutomationExecution
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                  - ssm:DescribeInstanceInformation
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:StopInstances
+                  - ec2:StartInstances
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-SSMAutomationRole"
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: LaunchAutomatedPatching
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-LambdaExecutionRole"
+
+  # S3 Bucket for AWS Config
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    Condition: LaunchAutomatedPatching
+    DeletionPolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-ConfigBucket"
+
+  ConfigBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: LaunchAutomatedPatching
+    Properties:
+      Bucket: !Ref ConfigBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSConfigBucketPermissionsCheck
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub "arn:aws:s3:::${ConfigBucket}"
+          - Sid: AWSConfigBucketDelivery
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "arn:aws:s3:::${ConfigBucket}/AWSLogs/${AWS::AccountId}/Config/*"
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  # EC2 Instance for Patching
+  PatchMeUpInstance:
+    Type: AWS::EC2::Instance
+    Condition: LaunchAutomatedPatching
+    Properties:
+      InstanceType: !Ref InstanceType
+      SecurityGroupIds:
+        - !Ref WebSecurityGroup
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PublicSubnet1
+      IamInstanceProfile: !Ref EC2PatchInstanceProfile
+      ImageId: !Sub "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}"
+      Tags:
+        - Key: Name
+          Value: PatchMeUp
+        - Key: Environment
+          Value: PatchTest
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          # Update system
+          yum update -y
+          
+          # Ensure SSM agent is installed and running
+          yum install -y amazon-ssm-agent
+          systemctl enable amazon-ssm-agent
+          systemctl start amazon-ssm-agent
+
+  # SNS Topic for Notifications
+  PatchNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: LaunchAutomatedPatching
+    Properties:
+      DisplayName: Patch Compliance Alerts
+      TopicName: PatchDoneAlerts
+
+  # SNS Subscription for Email Notifications
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: LaunchAutomatedPatching
+    Properties:
+      Protocol: email
+      TopicArn: !Ref PatchNotificationTopic
+      Endpoint: !Ref AdminEmail
+
+  # Lambda Function for Patch Logging
+  PatchLoggerFunction:
+    Type: AWS::Lambda::Function
+    Condition: LaunchAutomatedPatching
+    Properties:
+      FunctionName: PatchLogger
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+
+          def lambda_handler(event, context):
+              print(f"Patch event detected: {json.dumps(event)}")
+              
+              instance_id = event.get('detail', {}).get('resourceId', 'unknown')
+              compliance_type = event.get('detail', {}).get('newEvaluationResult', {}).get('complianceType', 'unknown')
+              
+              print(f"Instance {instance_id} compliance status: {compliance_type}")
+              return {"status": "Logged"}
+      Timeout: 30
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-PatchLogger"
+
+  # AWS Config Recorder
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Condition: LaunchAutomatedPatching
+    Properties:
+      Name: default
+      RecordingGroup:
+        ResourceTypes:
+          - AWS::EC2::Instance
+      RoleARN: !GetAtt ConfigRole.Arn
+
+  # AWS Config Delivery Channel
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Condition: LaunchAutomatedPatching
+    Properties:
+      Name: default
+      S3BucketName: !Ref ConfigBucket
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: TwentyFour_Hours
+
+  # AWS Config Rule for Patch Compliance
+  PatchComplianceConfigRule:
+    Type: AWS::Config::ConfigRule
+    Condition: LaunchAutomatedPatching
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: ec2-managedinstance-patch-compliance-status-check
+      Description: Checks if EC2 instances are compliant with the patch baseline defined in Systems Manager
+      Source:
+        Owner: AWS
+        SourceIdentifier: EC2_MANAGEDINSTANCE_PATCH_COMPLIANCE_STATUS_CHECK
+
+  # EventBridge Rule for detecting patch compliance changes
+  PatchDriftCatcherRule:
+    Type: AWS::Events::Rule
+    Condition: LaunchAutomatedPatching
+    Properties:
+      Name: PatchDriftCatcher
+      Description: Detects when an EC2 instance becomes non-compliant with the patch baseline
+      EventPattern: !Sub |
+        {
+          "source": ["aws.config"],
+          "detail-type": ["Config Rules Compliance Change"],
+          "detail": {
+            "configRuleName": ["ec2-managedinstance-patch-compliance-status-check"],
+            "newEvaluationResult": {
+              "complianceType": ["NON_COMPLIANT"]
+            },
+            "resourceType": ["AWS::EC2::Instance"]
+          }
+        }
+      State: ENABLED
+      Targets:
+        - Arn: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/AWS-RunPatchBaseline:$DEFAULT"
+          Id: SSMAutomationTarget
+          RoleArn: !GetAtt EventBridgeRole.Arn
+          InputTransformer:
+            InputPathsMap:
+              instanceId: "$.detail.resourceId"
+            InputTemplate: !Sub |
+              {
+                "DocumentName": "AWS-RunPatchBaseline",
+                "Parameters": {
+                  "InstanceIds": ["<instanceId>"],
+                  "Operation": ["Install"]
+                },
+                "AutomationAssumeRole": "${SSMAutomationRole.Arn}"
+              }
+        - Arn: !Ref PatchNotificationTopic
+          Id: SNSTarget
+          RoleArn: !GetAtt EventBridgeRole.Arn
+          InputTransformer:
+            InputPathsMap:
+              instanceId: "$.detail.resourceId"
+            InputTemplate: |
+              "Patch automation started for instance <instanceId>"
+        - Arn: !GetAtt PatchLoggerFunction.Arn
+          Id: LambdaTarget
+
+  # AWS Systems Manager Patch Baseline Association
+  PatchBaselineAssociation:
+    Type: AWS::SSM::PatchBaseline
+    Condition: LaunchAutomatedPatching
+    Properties:
+      Name: DefaultServerPatchBaseline
+      Description: Patch baseline for Amazon Linux 2 instances
+      OperatingSystem: AMAZON_LINUX_2
+      ApprovalRules:
+        PatchRules:
+          - PatchFilterGroup:
+              PatchFilters:
+                - Key: PRODUCT
+                  Values:
+                    - AmazonLinux2
+                - Key: CLASSIFICATION
+                  Values:
+                    - Security
+                    - Bugfix
+                - Key: SEVERITY
+                  Values:
+                    - Critical
+                    - Important
+            ApproveAfterDays: 0
+      DefaultBaseline: true
+
+  # Python Verification Script for Checking Patch Status
+  VerificationScriptFunction:
+    Type: AWS::Lambda::Function
+    Condition: LaunchAutomatedPatching
+    Properties:
+      FunctionName: PatchVerificationScript
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import json
+          import time
+          import os
+
+          def lambda_handler(event, context):
+              instance_id = os.environ['INSTANCE_ID']
+              region = os.environ['AWS_REGION']
+              
+              results = {}
+              results['instance_managed'] = check_instance_managed(instance_id, region)
+              
+              if results['instance_managed']:
+                  results['missing_patches'] = check_missing_patches(instance_id, region)
+                  results['patch_state'] = get_patch_state(instance_id, region)
+              else:
+                  results['missing_patches'] = -1
+                  results['patch_state'] = None
+                  
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(results)
+              }
+
+          def check_instance_managed(instance_id, region):
+              ssm = boto3.client('ssm', region_name=region)
+              print(f"Checking if instance {instance_id} is managed by SSM...")
+              try:
+                  response = ssm.describe_instance_information(
+                      Filters=[{'Key': 'InstanceIds', 'Values': [instance_id]}]
+                  )
+                  if response['InstanceInformationList']:
+                      print(f"✅ Instance {instance_id} is managed by SSM")
+                      return True
+                  else:
+                      print(f"❌ Instance {instance_id} is NOT managed by SSM")
+                      return False
+              except Exception as e:
+                  print(f"❌ Error checking instance management status: {e}")
+                  return False
+
+          def check_missing_patches(instance_id, region):
+              ssm = boto3.client('ssm', region_name=region)
+              print(f"Checking for missing patches on {instance_id}...")
+              try:
+                  response = ssm.describe_instance_patches(
+                      InstanceId=instance_id,
+                      Filters=[{'Key': 'State', 'Values': ['Missing']}]
+                  )
+                  missing_count = len(response.get('Patches', []))
+                  print(f"Found {missing_count} missing patches")
+                  return missing_count
+              except Exception as e:
+                  print(f"❌ Error checking missing patches: {e}")
+                  return -1
+                  
+          def get_patch_state(instance_id, region):
+              ssm = boto3.client('ssm', region_name=region)
+              print(f"Getting patch state for {instance_id}...")
+              try:
+                  response = ssm.describe_instance_patch_states(
+                      InstanceIds=[instance_id]
+                  )
+                  if response['InstancePatchStates']:
+                      state = response['InstancePatchStates'][0]
+                      return {
+                          'MissingCount': state['MissingCount'],
+                          'FailedCount': state['FailedCount'],
+                          'InstalledCount': state['InstalledCount'],
+                          'Operation': state['Operation'],
+                          'LastUpdateTime': state['LastUpdateTime'].isoformat()
+                      }
+                  else:
+                      return None
+              except Exception as e:
+                  print(f"❌ Error getting patch state: {e}")
+                  return None
+      Environment:
+        Variables:
+          INSTANCE_ID: !Ref PatchMeUpInstance
+      Timeout: 60
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-VerificationScript"
+
+Outputs:
+  # Common Outputs
+  VpcId:
+    Description: The VPC ID
+    Value: !Ref VPC
+
+  # Multi-Stage Deployment Outputs
+  DevInstanceIP:
+    Condition: LaunchMultiStageDeployment
+    Description: Public IP of the Dev environment instance
+    Value: !If [LaunchMultiStageDeployment, !GetAtt DevInstance.PublicIp, "Lab not deployed"]
+    
+  TestInstanceIP:
+    Condition: LaunchMultiStageDeployment
+    Description: Public IP of the Test environment instance
+    Value: !If [LaunchMultiStageDeployment, !GetAtt TestInstance.PublicIp, "Lab not deployed"]
+    
+  ProdInstanceIP:
+    Condition: LaunchMultiStageDeployment
+    Description: Public IP of the Prod environment instance
+    Value: !If [LaunchMultiStageDeployment, !GetAtt ProdInstance.PublicIp, "Lab not deployed"]
+    
+  DynamoDBTableName:
+    Condition: LaunchMultiStageDeployment
+    Description: Name of the DynamoDB table for the application
+    Value: !If [LaunchMultiStageDeployment, !Ref UserDataTable, "Lab not deployed"]
+  
+  ArtifactBucketName:
+    Condition: LaunchMultiStageDeployment
+    Description: Name of the S3 bucket for artifacts
+    Value: !If [LaunchMultiStageDeployment, !Ref ArtifactBucket, "Lab not deployed"]
+
+  # Automated Patching Outputs  
+  PatchMeUpIP:
+    Condition: LaunchAutomatedPatching
+    Description: Public IP of the instance being patched
+    Value: !If [LaunchAutomatedPatching, !GetAtt PatchMeUpInstance.PublicIp, "Lab not deployed"]
+    
+  SSHCommandPatchInstance:
+    Condition: LaunchAutomatedPatching
+    Description: SSH command to connect to the patching instance
+    Value: !If [LaunchAutomatedPatching, !Sub "ssh -i ${KeyPairName}.pem ec2-user@${PatchMeUpInstance.PublicIp}", "Lab not deployed"]
+
+  CreateNonCompliantState:
+    Condition: LaunchAutomatedPatching
+    Description: Command to create a non-compliant state for testing
+    Value: !If 
+      - LaunchAutomatedPatching
+      - !Sub |
+        aws ssm send-command \
+          --document-name "AWS-RunPatchBaseline" \
+          --targets "Key=instanceIds,Values=${PatchMeUpInstance}" \
+          --parameters "Operation=Scan" \
+          --region ${AWS::Region}
+      - "Lab not deployed"
+
+  ForceConfigEvaluation:
+    Condition: LaunchAutomatedPatching
+    Description: Command to force AWS Config to evaluate the patch compliance rule
+    Value: !If 
+      - LaunchAutomatedPatching
+      - !Sub |
+        aws configservice start-config-rules-evaluation \
+          --config-rule-names ec2-managedinstance-patch-compliance-status-check \
+          --region ${AWS::Region}
+      - "Lab not deployed"
+
+  # Setup Instructions
+  MultiStageSetupInstructions:
+    Condition: LaunchMultiStageDeployment
+    Description: Multi-Stage Deployment Lab Setup Instructions
+    Value: !Sub |
+      Multi-Stage Deployment Lab (020-360) Setup:
+      1. Create a GitHub repository named 'multi-stage-app'
+      2. Update the CodeBuild project with your actual GitHub repository URL
+      3. Create a CodePipeline using the console with GitHub connection
+      4. Configure pipeline stages according to the lab instructions
+      
+      Dev instance: http://${DevInstance.PublicIp}
+      Test instance: http://${TestInstance.PublicIp}
+      Prod instance: http://${ProdInstance.PublicIp}
+
+  AutomatedPatchingSetupInstructions:
+    Condition: LaunchAutomatedPatching
+    Description: Automated Patching Lab Setup Instructions
+    Value: !Sub |
+      Automated Patching Lab (060-140) Setup:
+      1. Verify that the EC2 instance is managed by SSM
+      2. Use the Create Non-Compliant State command to scan for missing patches
+      3. Force AWS Config evaluation to detect non-compliance
+      4. Monitor the automated patching process
+      
+      Instance IP: ${PatchMeUpInstance.PublicIp}
+      SSH command: ssh -i ${KeyPairName}.pem ec2-user@${PatchMeUpInstance.PublicIp}
