@@ -7,7 +7,9 @@
     "build": "tsc",
     "start": "node dist/app.js",
     "lint": "eslint 'src/**/*.ts'",
-    "dev": "tsc && node dist/app.js"
+    "dev": "tsc && node dist/app.js",
+    "security-check": "npm audit --production",
+    "prepare": "husky install || echo 'Skipping husky install'"
   },
   "engines": {
     "node": ">=20.0.0"
@@ -22,9 +24,19 @@
     "@typescript-eslint/eslint-plugin": "^8.32.0",
     "@typescript-eslint/parser": "^8.32.0",
     "eslint": "^9.26.0",
+    "husky": "^9.0.11",
+    "lint-staged": "^15.2.0",
     "typescript": "^5.8.3"
   },
   "dependencies": {
-    "express": "^5.1.0"
+    "express": "^5.1.0",
+    "express-rate-limit": "^7.1.5",
+    "helmet": "^7.1.0"
+  },
+  "lint-staged": {
+    "*.ts": [
+      "eslint --fix",
+      "npm run security-check"
+    ]
   }
 }
