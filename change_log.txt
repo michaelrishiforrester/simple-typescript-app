@@ -1,0 +1,21 @@
+CHANGE LOG
+==========
+
+Version 1.0.0 (2025-05-09)
+--------------------------
+- Initial release of the Simple TypeScript App
+- Features:
+  * Express web server implementation
+  * Security headers with Helmet
+  * Rate limiting to prevent abuse
+  * Basic error handling
+  * Docker containerization
+  * AWS CI/CD pipeline setup
+  * Deployment scripts
+
+Technical details:
+- TypeScript 5.8.3
+- Express.js 5.1.0
+- Node.js 20+ runtime
+- Helmet 7.1.0 for security headers
+- Express Rate Limit 7.1.5

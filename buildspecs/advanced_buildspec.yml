@@ -1,0 +1,119 @@
+version: 0.2
+
+env:
+  variables:
+    NODE_ENV: "production"
+  parameter-store:
+    DYNAMODB_TABLE: "/foodtruckfinder/dynamodb-table-name"
+    DEPLOYMENT_BUCKET: "/foodtruckfinder/deployment-bucket"
+  exported-variables:
+    - FUNCTION_VERSION
+    - COMMIT_HASH
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20
+    commands:
+      - echo Installing dependencies...
+      - yum install -y gettext # For envsubst
+      - npm install
+      - npm install -g aws-cdk aws-sam-cli
+      - npm install --save-dev jest-junit # Required for test reporting
+      - export COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+  
+  pre_build:
+    commands:
+      - echo Running pre-build checks...
+      - npm run lint
+      - echo Running tests...
+      - npm test -- --coverage --testResultsProcessor=jest-junit
+      - echo Checking for security vulnerabilities...
+      - npm audit --audit-level=high || true # Don't fail build on audit issues
+  
+  build:
+    commands:
+      - echo Build started on `date`
+      - echo Setting build version...
+      - export FUNCTION_VERSION=$(date +%Y%m%d%H%M%S)-${COMMIT_HASH}
+      - echo "Building version $FUNCTION_VERSION"
+      
+      # Create deployment packages for different environments
+      - mkdir -p dist/{dev,staging,prod}
+      
+      # Base package preparation
+      - mkdir -p dist/base
+      - cp index.js dist/base/
+      - cp package.json dist/base/
+      - cd dist/base && npm install --production && cd $CODEBUILD_SRC_DIR
+      
+      # Dev environment package
+      - cp -r dist/base/* dist/dev/
+      - echo "Creating dev environment package with logging enabled"
+      - echo '{"logLevel": "debug"}' > dist/dev/config.json
+      
+      # Staging environment package
+      - cp -r dist/base/* dist/staging/
+      - echo "Creating staging environment package"
+      - echo '{"logLevel": "info"}' > dist/staging/config.json
+      
+      # Production environment package
+      - cp -r dist/base/* dist/prod/
+      - echo "Creating production environment package"
+      - echo '{"logLevel": "warning"}' > dist/prod/config.json
+      
+      # Package all environments
+      - cd $CODEBUILD_SRC_DIR
+      - cd dist/dev && zip -r ../../function-dev.zip * && cd $CODEBUILD_SRC_DIR
+      - cd dist/staging && zip -r ../../function-staging.zip * && cd $CODEBUILD_SRC_DIR
+      - cd dist/prod && zip -r ../../function-prod.zip * && cd $CODEBUILD_SRC_DIR
+      
+      # Update CloudFormation templates with environment variables
+      - envsubst < template.yml > dist/template.yml
+  
+  post_build:
+    commands:
+      - echo Build completed on `date`
+      - echo Uploading artifacts...
+      - aws s3 cp function-dev.zip s3://${DEPLOYMENT_BUCKET}/food-truck-finder/${FUNCTION_VERSION}/function-dev.zip
+      - aws s3 cp function-staging.zip s3://${DEPLOYMENT_BUCKET}/food-truck-finder/${FUNCTION_VERSION}/function-staging.zip
+      - aws s3 cp function-prod.zip s3://${DEPLOYMENT_BUCKET}/food-truck-finder/${FUNCTION_VERSION}/function-prod.zip
+      - aws s3 cp dist/template.yml s3://${DEPLOYMENT_BUCKET}/food-truck-finder/${FUNCTION_VERSION}/template.yml
+      
+      # Create deployment manifests
+      - echo "{\"version\": \"${FUNCTION_VERSION}\", \"artifactBucket\": \"${DEPLOYMENT_BUCKET}\", \"artifactKey\": \"food-truck-finder/${FUNCTION_VERSION}/function-dev.zip\"}" > deployment-dev.json
+      - echo "{\"version\": \"${FUNCTION_VERSION}\", \"artifactBucket\": \"${DEPLOYMENT_BUCKET}\", \"artifactKey\": \"food-truck-finder/${FUNCTION_VERSION}/function-staging.zip\"}" > deployment-staging.json
+      - echo "{\"version\": \"${FUNCTION_VERSION}\", \"artifactBucket\": \"${DEPLOYMENT_BUCKET}\", \"artifactKey\": \"food-truck-finder/${FUNCTION_VERSION}/function-prod.zip\"}" > deployment-prod.json
+      
+      # Tag successful build
+      - if [ "$CODEBUILD_BUILD_SUCCEEDING" = "1" ]; then
+      -   aws s3 cp deployment-dev.json s3://${DEPLOYMENT_BUCKET}/food-truck-finder/latest/deployment-dev.json
+      -   aws s3 cp deployment-staging.json s3://${DEPLOYMENT_BUCKET}/food-truck-finder/latest/deployment-staging.json
+      -   aws s3 cp deployment-prod.json s3://${DEPLOYMENT_BUCKET}/food-truck-finder/latest/deployment-prod.json
+      - fi
+
+artifacts:
+  files:
+    - function-dev.zip
+    - function-staging.zip
+    - function-prod.zip
+    - dist/template.yml
+    - deployment-dev.json
+    - deployment-staging.json
+    - deployment-prod.json
+  discard-paths: yes
+
+cache:
+  paths:
+    - 'node_modules/**/*'
+    - '/root/.npm/**/*'
+
+reports:
+  jest_reports:
+    files:
+      - 'junit.xml'
+    file-format: JUNITXML
+  coverage_reports:
+    files:
+      - 'coverage/clover.xml'
+    file-format: CLOVERXML
